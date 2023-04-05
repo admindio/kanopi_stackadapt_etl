@@ -41,7 +41,7 @@ def delete_last_synced_date(client, table_name, date:str) :
     result = client.query(query).result()
     return
 
-def main(data, context) :
+def main() :
     project_id = "kanopibyarmstrong"
     dataset_id = "stackadapt"
     table_id = "stackadapt_daily"

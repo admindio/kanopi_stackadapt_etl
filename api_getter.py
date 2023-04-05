@@ -73,26 +73,30 @@ def get_delivery_stats(api_key, campaign: dict, start_date = None, end_date = No
 
     return clean_stats
 
-def get_incremental_data(start_date, end_date=None) :
-	campaigns = get_campaigns(api_key)
-	combined_stats = []
-	counter = 1
-	for c in campaigns :
-	    stats = get_delivery_stats(api_key, c, start_date, end_date)
-	    combined_stats.extend(stats)
-	    print(f"{counter} of {len(campaigns)} campaigns processed")
-	    sleep(.1)
-	    counter += 1
+def scrub_df(df) :
+    df = df.fillna(0)
+    for col in ['created_at','updated_at','date','start_date','end_date'] :
+        df[col] = pd.to_datetime(df[col])
+    
+    df = df.astype({
+      'unique_imp':'int64',
+      'bid_amount_total':'int64'
+      })
+    return df
 
-	df = pd.DataFrame(combined_stats).fillna(0)
-	df = df.astype({
-		'unique_imp':'int64',
-		'bid_amount_total':'int64',
-		'date': 'datetime64[ns]',
-		'start_date': 'datetime64[ns]',
-		'end_date': 'datetime64[ns]',
-		'created_at': 'datetime64[ns]',
-		'updated_at': 'datetime64[ns]'
-		})
-	return df
+def get_incremental_data(start_date, end_date=None) :
+    campaigns = get_campaigns(api_key)
+    combined_stats = []
+    counter = 1
+    for c in campaigns :
+        stats = get_delivery_stats(api_key, c, start_date, end_date)
+        combined_stats.extend(stats)
+        print(f"{counter} of {len(campaigns)} campaigns processed")
+        sleep(.1)
+        counter += 1
+
+    df = pd.DataFrame(combined_stats)
+    df = scrub_df(df)
+
+    return df
 
