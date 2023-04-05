@@ -1,159 +1,69 @@
-"""Pulls data from Google Search Console 25,000 rows at a time and loads it to BigQuery one calendar day at a a time.
+"""
+Pulls data from an api and inserts into BigQuery.
 
-Logging is done through print statements (Cloud Function preference)
+The module api_getter takes in a start_date and optional end_date and returns a pandas dataframe with all dtypes scrubbed.
 
-Script checks last date written to BigQuery and starts iterating from there.
-This typically takes 30 seconds per day and Cloud Functions has a 9 minute timeout.
+This is meant to be a fairly generic script. Replacing the contents of api_getter persuant to whatever api is called would let this script
+be deployed toward any future api.
 
-Data is only pulled up to 4 days ago to avoid GSC limits where data may not appear for the last 72 hours
+If the table doesn't exist in BigQuery, the first run will create it.
 
-Google cloud credentials are inherited from the service account assigned to the cloud function at time of creation.
+Google Cloud Functions will start the chain of events with the main function.
 """
 
-from datetime import datetime, timedelta
-
-from google.auth import credentials
-from googleapiclient.discovery import build
+import os
+import api_getter
 import pandas as pd
 from google.cloud import bigquery
+from datetime import timedelta, date
 
-def gsc_request_definition(start_row, dimensions, start_date, end_date, limit=25000):
-    """Returns a valid GSC API request as a dict
-
-    Parameters
-    ----------
-    start_row : int
-        The table name to load data to in BQ
-    dimensions : list of column names to request from GSC (current set in global variables)
-    start_date : datetime
-    end_date : datetime (start_date and end_date should always be the same in this job)
-    limit: int
-        The max number of records to fetch during each API poll
-        GSC API max limit is 25000
-
-    Returns
-    -------
-    request
-        The completed request dict ready for GSC usage
-    """
-    startdate_string = start_date.strftime("%Y-%m-%d")
-    enddate_string = end_date.strftime("%Y-%m-%d")
-    
-    # Create a request body
-    return {
-      'startDate': startdate_string,
-      'endDate': enddate_string,
-      'dimensions': dimensions, # hard coded to ensure no dataframe coercion mishaps
-      'rowLimit': limit,
-      'startRow': start_row
-    }
-
-def bq_table_definition(project_name, dataset_name, table_name):
-    """Sets up the BigQuery client to be ready to load data to correct table
-
-    Parameters
-    ----------
-    project_name : str
-        the project name to load data to in BQ
-    dataset_name : str
-        The dataset name to load data to in BQ
-    table_name : str
-        The table name to load data to in BQ
-
-    Returns
-    -------
-    job_config
-        The completed job config to use for loading to BigQuery
+def get_last_synced_date(client, table_name) :
+    query = f"""
+    SELECT MAX(date) AS max_date
+    FROM `{table_name}`
     """
 
-    # Create a job config
-    job_config = bigquery.LoadJobConfig()
+    # Make the query and get the result
+    result = client.query(query).result()
 
-    # Set the destination table
-    # table_ref = client.dataset(dataset_id).table(table_name)
-    table_ref = f'{project_name}.{dataset_name}.{table_name}'
+    # Get the max date from the result
+    max_date = next(result).get('max_date')
+    return max_date
 
-    # Update job config to reference the table & to append to existing data if any
-    # job_config.destination = table_ref
-    job_config.write_disposition = 'WRITE_APPEND'
+def delete_last_synced_date(client, table_name, date:str) :
+    query = f"""
+    DELETE
+    FROM `{table_name}`
+    WHERE date >= '{date}'
+    """
 
-    return {
-        "config": job_config,
-        "table": table_ref
-    }
+    # Make the query and get the result
+    result = client.query(query).result()
+    return
 
 def main(data, context) :
-    ########### ENV Variables ####################################
-    PROPERTY = 'okta.com'
-    BQ_PROJECT_NAME = 'okta-ga-rollup'
-    BQ_DATASET_NAME = 'search_console'
-    BQ_TABLE_NAME = 'sc_daily'
-    MAX_GSC_ROWS = 500000
-    DIMENSIONS = ['date','page','query','device','country']
-    ################ END OF ENV Variables ########################
+    project_id = "kanopibyarmstrong"
+    dataset_id = "stackadapt"
+    table_id = "stackadapt_daily"
 
-    # local variables
-    batch_size = 25000 #number of rows to request from Search Console at a time. 25000 is search console API max.
-    lag_days = 4 #number of days before today to stop iteration. Gives Search Console some time to coalesce data.
+    table_name = f"{project_id}.{dataset_id}.{table_id}"
 
-    # Log into GSC and Setup Service
-    print('## Setting Up Service for GSC')
-    gsc_service = build('webmasters','v3')
+    client = bigquery.Client()
 
-    # Set up BigQuery Table and Client
-    print('## Creating BigQuery Client')
-    bq_client = bigquery.Client()
+    print('## querying last synced date')
+    try:
+        last_synced_date = get_last_synced_date(client, table_name)
+    except:
+        last_synced_date = date(2021,2,1) #change this date based on the earliest known available data in the API.
 
-    print('## Creating BigQuery Table Definition')
-    bq_config = bq_table_definition(client=bq_client, project_name=BQ_PROJECT_NAME, dataset_name=BQ_DATASET_NAME, table_name=BQ_TABLE_NAME)
+    start_date = last_synced_date - timedelta(1)
+    start_date = start_date.strftime('%Y-%m-%d %H:%M:%S')
 
-    # get dates
-    query_job = bq_client.query(f"SELECT max(date) FROM `{BQ_PROJECT_NAME}.{BQ_DATASET_NAME}.{BQ_TABLE_NAME}` where date >= '2021-08-01'")
-    results = query_job.result()
-    last_date = results.to_dataframe()
-    check_date = last_date.iloc[0,0] + timedelta(days=1)
-    end_date = datetime.now().date() - timedelta(days=lag_days)
+    print('## pulling api data')
+    df = api_getter.get_incremental_data(start_date)
 
-    # Loop through all dates from start_date to end_date. Write to BQ once per date (no partial dates written to BQ).
+    print('## deleting the most recently synced date from BigQuery')
+    delete_last_synced_date(client, table_name, start_date)
 
-    print('## Starting Daily Push to BigQuery')
-
-    while check_date <= end_date :
-        df = pd.DataFrame()
-        for x in range(0, MAX_GSC_ROWS, batch_size):
-
-            # create current request
-            cur_request = gsc_request_definition(start_row=x, dimensions=DIMENSIONS, start_date=check_date, end_date=check_date, limit=batch_size)
-
-            #get up to 25,000 records from GSC API
-            print(f'## Fetching Analytics From GSC for {str(check_date)} rows {x} through {x+batch_size}')
-            cur_fetch = gsc_service.searchanalytics().query(siteUrl=("sc-domain:" + PROPERTY), body=cur_request).execute()
-
-            if len(cur_fetch) > 1:
-                df = df.append(pd.DataFrame.from_dict(cur_fetch['rows']))
-            
-            if len(cur_fetch['rows']) < batch_size :
-                print('## No More Records to Grab For This Date.')
-                break
-
-        # split the keys list into columns
-        df[DIMENSIONS] = pd.DataFrame(df['keys'].values.tolist(), index=df.index)
-
-        # Drop the key columns
-        result = df.drop(['keys'],axis=1)
-
-        # Add a website identifier
-        result['website'] = PROPERTY
-
-        # Change string date to datetime
-        result['date'] = result['date'].astype('datetime64')
-
-        # Load to BigQuery
-        print(f'## Loading {len(result)} rows to BigQuery')
-        
-        load_job = bq_client.load_table_from_dataframe(dataframe=result, destination=bq_config["table"], job_config=bq_config["config"]).result()
-        
-        #increment check_date to restart loop
-        check_date += timedelta(days=1)
-
-    print('## All Dates Added to BigQuery')
+    print('## inserting rows from the api pull into BigQuery')
+    df.to_gbq(destination_table = f"{dataset_id}.{table_id}", project_id = project_id, chunksize = 10000, if_exists='append')
